@@ -2,7 +2,7 @@ import os
 import secrets
 import string
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
@@ -13,6 +13,7 @@ DB_PATH = os.getenv("DB_PATH", "xyntrix.db")
 WEB_URL = os.getenv("WEB_URL", "http://localhost:10000").rstrip("/")
 ADMIN_ROLE_ID = int(os.getenv("ADMIN_ROLE_ID", "0") or 0)
 WHITELIST_ROLE_ID = int(os.getenv("WHITELIST_ROLE_ID", "0") or 0)
+HWID_COOLDOWN_HOURS = 24
 
 # ========== DATABASE ==========
 def db():
@@ -31,7 +32,8 @@ def init_db():
             hwid TEXT,
             created_at TEXT NOT NULL,
             last_used TEXT,
-            uses INTEGER NOT NULL DEFAULT 0
+            uses INTEGER NOT NULL DEFAULT 0,
+            last_hwid_reset TEXT
         )
     """)
     conn.commit()
@@ -54,52 +56,35 @@ class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         
-        # Redeem Key - OPENS POPUP IN DISCORD
         self.add_item(discord.ui.Button(
             label="🔑 Redeem Key",
             style=discord.ButtonStyle.primary,
             custom_id="redeem_key"
         ))
         
-        # Get Script - GOES TO WEBSITE
         self.add_item(discord.ui.Button(
             label="📜 Get Script",
-            style=discord.ButtonStyle.link,
-            url=f"{WEB_URL}/script"
+            style=discord.ButtonStyle.primary,
+            custom_id="get_script"
         ))
         
-        # Get Role - AUTO GRANTS ROLE
         self.add_item(discord.ui.Button(
             label="👤 Get Role",
             style=discord.ButtonStyle.secondary,
             custom_id="get_role"
         ))
         
-        # Reset HWID - GOES TO WEBSITE
         self.add_item(discord.ui.Button(
             label="⚙️ Reset HWID",
-            style=discord.ButtonStyle.link,
-            url=f"{WEB_URL}/reset"
+            style=discord.ButtonStyle.danger,
+            custom_id="reset_hwid"
         ))
         
-        # Stats - GOES TO WEBSITE
         self.add_item(discord.ui.Button(
             label="📊 Stats",
-            style=discord.ButtonStyle.link,
-            url=f"{WEB_URL}/stats"
+            style=discord.ButtonStyle.secondary,
+            custom_id="show_stats"
         ))
-
-# ========== BOT ==========
-class Bot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        self.add_view(PanelView())
-        await self.tree.sync()
-
-bot = Bot()
 
 # ========== MODAL FOR REDEEM ==========
 class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
@@ -126,7 +111,6 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
         if row["discord_id"] != str(interaction.user.id):
             return await interaction.response.send_message("❌ This key doesn't belong to you.", ephemeral=True)
         
-        # Grant role if configured
         if WHITELIST_ROLE_ID:
             role = interaction.guild.get_role(WHITELIST_ROLE_ID)
             if role:
@@ -139,6 +123,18 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
                     return
         
         await interaction.response.send_message(f"✅ Key `{key}` is valid!", ephemeral=True)
+
+# ========== BOT ==========
+class Bot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        self.add_view(PanelView())
+        await self.tree.sync()
+
+bot = Bot()
 
 # ========== EVENTS ==========
 @bot.event
@@ -156,6 +152,30 @@ async def on_interaction(interaction: discord.Interaction):
     # Handle Redeem Key button
     if custom_id == "redeem_key":
         await interaction.response.send_modal(RedeemModal())
+        return
+    
+    # Handle Get Script button
+    if custom_id == "get_script":
+        conn = db()
+        row = conn.execute(
+            "SELECT key FROM licenses WHERE discord_id=? AND active=1 LIMIT 1",
+            (str(interaction.user.id),)
+        ).fetchone()
+        conn.close()
+        
+        if not row:
+            return await interaction.response.send_message("❌ You need an active license first!", ephemeral=True)
+        
+        loadstring = f'script_key = "{row["key"]}"\nloadstring(game:HttpGet("https://xyntrix-auth.onrender.com/api/script?key=" .. script_key))()'
+        
+        embed = discord.Embed(
+            title="📜 Your Script Loadstring",
+            description=f"```lua\n{loadstring}\n```",
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Copy this into your executor")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     
     # Handle Get Role button
@@ -185,6 +205,59 @@ async def on_interaction(interaction: discord.Interaction):
             await interaction.response.send_message("✅ Whitelist role granted!", ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message("❌ I can't manage that role. Put my role above the whitelist role.", ephemeral=True)
+        return
+    
+    # Handle Reset HWID button
+    if custom_id == "reset_hwid":
+        conn = db()
+        row = conn.execute(
+            "SELECT key, hwid, last_hwid_reset FROM licenses WHERE discord_id=? AND active=1 LIMIT 1",
+            (str(interaction.user.id),)
+        ).fetchone()
+        conn.close()
+        
+        if not row:
+            return await interaction.response.send_message("❌ You don't have an active license.", ephemeral=True)
+        
+        # Check cooldown
+        if row["last_hwid_reset"]:
+            last_reset = datetime.fromisoformat(row["last_hwid_reset"])
+            time_since = datetime.now(timezone.utc) - last_reset
+            if time_since < timedelta(hours=HWID_COOLDOWN_HOURS):
+                remaining = timedelta(hours=HWID_COOLDOWN_HOURS) - time_since
+                hours = int(remaining.total_seconds() // 3600)
+                minutes = int((remaining.total_seconds() % 3600) // 60)
+                return await interaction.response.send_message(
+                    f"⏳ HWID reset on cooldown! Next reset available in **{hours}h {minutes}m**.",
+                    ephemeral=True
+                )
+        
+        # Reset HWID
+        conn = db()
+        conn.execute(
+            "UPDATE licenses SET hwid=NULL, last_hwid_reset=? WHERE key=?",
+            (datetime.now(timezone.utc).isoformat(), row["key"])
+        )
+        conn.commit()
+        conn.close()
+        
+        await interaction.response.send_message("✅ HWID has been reset! You can now use your key on a new device.", ephemeral=True)
+        return
+    
+    # Handle Stats button
+    if custom_id == "show_stats":
+        conn = db()
+        total = conn.execute("SELECT COUNT(*) c FROM licenses").fetchone()["c"]
+        active = conn.execute("SELECT COUNT(*) c FROM licenses WHERE active=1").fetchone()["c"]
+        uses = conn.execute("SELECT COALESCE(SUM(uses),0) c FROM licenses").fetchone()["c"]
+        conn.close()
+        
+        embed = discord.Embed(title="📊 XYNTRIX Stats", color=discord.Color.gold())
+        embed.add_field(name="Total keys", value=str(total))
+        embed.add_field(name="Active keys", value=str(active))
+        embed.add_field(name="Script requests", value=str(uses))
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
 # ========== SLASH COMMANDS ==========
@@ -278,27 +351,4 @@ def main():
     bot.run(token)
 
 if __name__ == "__main__":
-    main()self.add_item(discord.ui.Button(  
-    label="?? Get Script",  
-    style=discord.ButtonStyle.primary,  
-    custom_id="get_script"  
-))  
-if custom_id == "get_script":  
-    conn = db()  
-    row = conn.execute(  
-        "SELECT key FROM licenses WHERE discord_id=? AND active=1 LIMIT 1",  
-        (str(interaction.user.id),)  
-    ).fetchone()  
-    conn.close()  
-    if not row:  
-        return await interaction.response.send_message("? You need an active license first!", ephemeral=True)  
-    loadstring = f'script_key = "{row["key"]}"\nloadstring(game:HttpGet("https://xyntrix-auth.onrender.com/api/script?key=" .. script_key))()'  
-    embed = discord.Embed(  
-        title="?? Your Script Loadstring",  
-        description=f"```lua\n{loadstring}\n```",  
-        color=discord.Color.gold()  
-    )  
-    embed.set_footer(text="Copy this into your executor")  
-    await interaction.response.send_message(embed=embed, ephemeral=True)  
-    return  
-
+    main()
