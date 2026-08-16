@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XYNTRIXREDEEMER</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="card">
+  <div class="brand">XYNTRIX<span>REDEEMER</span></div>
+  <p>This control panel is for <b>XYNTRIXREDEEMER</b>.</p>
+  <p>Redeem your Discord license key to access your authorized software.</p>
+  <div class="actions">
+    <a href="/" class="btn gold">🔑 Redeem Key</a>
+    <a href="/script" class="btn">📜 Get Script</a>
+    <a href="/stats" class="btn">📊 Get Stats</a>
+  </div>
+  <form id="redeem">
+    <input id="key" placeholder="XYN-XXXXX-XXXXX-XXXXX-XXXXX" autocomplete="off">
+    <button>Redeem</button>
+  </form>
+  <div id="result"></div>
+</div>
+<script>
+document.querySelector("#redeem").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const result = document.querySelector("#result");
+  const key = document.querySelector("#key").value.trim();
+  result.textContent = "Checking...";
+  const r = await fetch("/api/redeem", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({key})
+  });
+  const data = await r.json();
+  result.textContent = data.ok ? "✅ Key accepted. Your license is active." : "❌ " + data.error;
+});
+</script>
+</body>
+</html>

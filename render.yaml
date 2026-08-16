@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: xyntrixscripts
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app
+    envVars:
+      - key: DB_PATH
+        value: /var/data/xyntrix.db
+      - key: SCRIPT_FILE
+        value: script.lua
+    disk:
+      name: xyntrix-data
+      mountPath: /var/data
+      sizeGB: 1
+
+  - type: worker
+    name: xyntrix-discord
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DB_PATH
+        value: /var/data/xyntrix.db
+      - key: WEB_URL
+        sync: false
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: ADMIN_ROLE_ID
+        sync: false
+      - key: WHITELIST_ROLE_ID
+        sync: false
+    disk:
+      name: xyntrix-bot-data
+      mountPath: /var/data
+      sizeGB: 1
