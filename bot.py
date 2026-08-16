@@ -301,3 +301,4 @@ if custom_id == "get_script":
     embed.set_footer(text="Copy this into your executor")  
     await interaction.response.send_message(embed=embed, ephemeral=True)  
     return  
+
