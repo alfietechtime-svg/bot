@@ -193,6 +193,7 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -318,6 +319,125 @@ async def on_interaction(interaction: discord.Interaction):
         
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
+
+# ========== MESSAGE HANDLER FOR NUMBER GUESSING (INFINITE GUESSES) ==========
+@bot.event
+async def on_message(message):
+    # Ignore bot messages and DMs
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
+    
+    # Check if there's an active number game
+    conn = db()
+    game = conn.execute(
+        "SELECT * FROM number_games WHERE active=1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    
+    if not game:
+        conn.close()
+        await bot.process_commands(message)
+        return
+    
+    # Try to parse the message as a number
+    try:
+        number = int(message.content.strip())
+    except ValueError:
+        await bot.process_commands(message)
+        return
+    
+    # Check if game already has a winner
+    if game["winner_id"]:
+        conn.close()
+        await bot.process_commands(message)
+        return
+    
+    # Update guesses (just counting, no limit!)
+    new_guesses = game["guesses"] + 1
+    conn.execute(
+        "UPDATE number_games SET guesses=? WHERE id=?",
+        (new_guesses, game["id"])
+    )
+    conn.commit()
+    
+    if number == game["number"]:
+        # WINNER!
+        prize_type = game["prize_type"]
+        prize_value = game["prize_value"]
+        
+        # Create the prize key(s)
+        keys = []
+        if prize_type == "lifetime":
+            prize_display = "🔑 LIFETIME"
+            key = make_key()
+            conn.execute(
+                "INSERT INTO licenses(key, discord_id, username, created_at) VALUES (?, ?, ?, ?)",
+                (key, str(message.author.id), str(message.author), datetime.now(timezone.utc).isoformat())
+            )
+            keys.append(key)
+        else:
+            if prize_type == "day":
+                days = prize_value
+                prize_display = f"{prize_value} Day(s)"
+            elif prize_type == "week":
+                days = prize_value * 7
+                prize_display = f"{prize_value} Week(s)"
+            elif prize_type == "month":
+                days = prize_value * 30
+                prize_display = f"{prize_value} Month(s)"
+            elif prize_type == "year":
+                days = prize_value * 365
+                prize_display = f"{prize_value} Year(s)"
+            else:
+                days = 1
+            
+            key = make_key()
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+            conn.execute(
+                "INSERT INTO licenses(key, discord_id, username, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (key, str(message.author.id), str(message.author), datetime.now(timezone.utc).isoformat(), expires_at)
+            )
+            keys.append(key)
+        
+        # Mark game as won
+        conn.execute(
+            "UPDATE number_games SET active=0, winner_id=?, winner_name=?, won_at=? WHERE id=?",
+            (str(message.author.id), str(message.author), datetime.now(timezone.utc).isoformat(), game["id"])
+        )
+        conn.commit()
+        conn.close()
+        
+        # Send prize via DM
+        key_list = "\n".join([f"`{k}`" for k in keys])
+        try:
+            embed = discord.Embed(
+                title="🎉 You Guessed the Number!",
+                description=f"The number was **{game['number']}**!\n\n"
+                            f"🏆 Prize: **{prize_display}**\n"
+                            f"🔑 Key: {key_list}\n\n"
+                            f"Redeem it using the **'Redeem Key'** button!",
+                color=discord.Color.green()
+            )
+            view = CopyButton("\n".join(keys), "📋 Copy Key")
+            await message.author.send(embed=embed, view=view)
+            await message.channel.send(
+                f"🎉 {message.author.mention} guessed the number **{game['number']}**! They won **{prize_display}**! Check your DMs!"
+            )
+        except:
+            await message.channel.send(
+                f"🎉 {message.author.mention} guessed the number **{game['number']}**! They won **{prize_display}**!\n{key_list}\n\n(Please open your DMs for future prizes)"
+            )
+    
+    else:
+        # Wrong guess - give hint (NO LIMIT - INFINITE GUESSES!)
+        hint = "higher" if number < game["number"] else "lower"
+        conn.close()
+        
+        await message.channel.send(
+            f"❌ {number} is too **{hint}**! Keep guessing! (No limit)"
+        )
+    
+    await bot.process_commands(message)
 
 # ========== SLASH COMMANDS ==========
 
@@ -617,7 +737,7 @@ async def riddles(interaction: discord.Interaction):
 @bot.tree.command(name="startnumber", description="Start a 'Guess the Number' game")
 @app_commands.describe(
     max_number="Maximum number to guess (e.g., 100)",
-    max_guesses="Maximum guesses allowed (default: 5)",
+    max_guesses="Maximum guesses allowed (default: 5) - NOTE: This is now ignored, infinite guesses!",
     prize_type="Type of prize: lifetime, day, week, month, year",
     prize_value="Number of days/weeks/months/years (e.g., 1, 2, 7)",
     winning_number="The number that wins (optional, random if not set)"
@@ -635,9 +755,6 @@ async def startnumber(
     
     if max_number < 10 or max_number > 10000:
         return await interaction.response.send_message("❌ Max number must be between 10 and 10000.", ephemeral=True)
-    
-    if max_guesses < 1 or max_guesses > 20:
-        return await interaction.response.send_message("❌ Max guesses must be between 1 and 20.", ephemeral=True)
     
     prize_types = ["lifetime", "day", "week", "month", "year"]
     if prize_type.lower() not in prize_types:
@@ -660,7 +777,7 @@ async def startnumber(
         """INSERT INTO number_games 
            (number, prize_type, prize_value, max_guesses, created_by, created_at) 
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (secret_number, prize_type.lower(), prize_value, max_guesses, str(interaction.user), datetime.now(timezone.utc).isoformat())
+        (secret_number, prize_type.lower(), prize_value, 999999, str(interaction.user), datetime.now(timezone.utc).isoformat())
     )
     game_id = cursor.lastrowid
     conn.commit()
@@ -682,143 +799,14 @@ async def startnumber(
         title="🎯 Guess the Number!",
         description=f"I'm thinking of a number between **1 and {max_number}**.\n\n"
                     f"💡 Prize: **{prize_display}**\n"
-                    f"🎯 Max Guesses: **{max_guesses}**\n\n"
-                    f"Use `/guessnumber <number>` to guess!",
+                    f"♾️ **Infinite Guesses!**\n\n"
+                    f"Just type a number in chat to guess!",
         color=discord.Color.blue()
     )
     embed.set_footer(text=f"Game #{game_id} | Posted by {interaction.user.name}")
     
     await interaction.channel.send(embed=embed)
     await interaction.response.send_message(f"✅ Number game started! (Winning number: {secret_number if winning_number else 'random'})", ephemeral=True)
-
-@bot.tree.command(name="guessnumber", description="Guess the number in the current game")
-@app_commands.describe(number="Your guess")
-async def guessnumber(interaction: discord.Interaction, number: int):
-    conn = db()
-    
-    # Find active game
-    game = conn.execute(
-        "SELECT * FROM number_games WHERE active=1 ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    
-    if not game:
-        conn.close()
-        return await interaction.response.send_message("❌ No active number game!", ephemeral=True)
-    
-    if game["winner_id"]:
-        conn.close()
-        return await interaction.response.send_message(f"❌ This game has already been won by {game['winner_name']}!", ephemeral=True)
-    
-    # Check if user already won
-    if game["winner_id"] == str(interaction.user.id):
-        conn.close()
-        return await interaction.response.send_message("❌ You already won this game!", ephemeral=True)
-    
-    # Update guesses
-    new_guesses = game["guesses"] + 1
-    conn.execute(
-        "UPDATE number_games SET guesses=? WHERE id=?",
-        (new_guesses, game["id"])
-    )
-    conn.commit()
-    
-    if number == game["number"]:
-        # WINNER!
-        prize_type = game["prize_type"]
-        prize_value = game["prize_value"]
-        
-        # Create the prize key(s)
-        keys = []
-        if prize_type == "lifetime":
-            prize_display = "🔑 LIFETIME"
-            key = make_key()
-            conn.execute(
-                "INSERT INTO licenses(key, discord_id, username, created_at) VALUES (?, ?, ?, ?)",
-                (key, str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat())
-            )
-            keys.append(key)
-        else:
-            if prize_type == "day":
-                days = prize_value
-                prize_display = f"{prize_value} Day(s)"
-            elif prize_type == "week":
-                days = prize_value * 7
-                prize_display = f"{prize_value} Week(s)"
-            elif prize_type == "month":
-                days = prize_value * 30
-                prize_display = f"{prize_value} Month(s)"
-            elif prize_type == "year":
-                days = prize_value * 365
-                prize_display = f"{prize_value} Year(s)"
-            else:
-                days = 1
-            
-            for _ in range(1):  # 1 key per win
-                key = make_key()
-                expires_at = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-                conn.execute(
-                    "INSERT INTO licenses(key, discord_id, username, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                    (key, str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat(), expires_at)
-                )
-                keys.append(key)
-        
-        # Mark game as won
-        conn.execute(
-            "UPDATE number_games SET active=0, winner_id=?, winner_name=?, won_at=? WHERE id=?",
-            (str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat(), game["id"])
-        )
-        conn.commit()
-        conn.close()
-        
-        # Send prize via DM
-        key_list = "\n".join([f"`{k}`" for k in keys])
-        try:
-            embed = discord.Embed(
-                title="🎉 You Guessed the Number!",
-                description=f"The number was **{game['number']}**!\n\n"
-                            f"🏆 Prize: **{prize_display}**\n"
-                            f"🔑 Key: {key_list}\n\n"
-                            f"Redeem it using the **'Redeem Key'** button!",
-                color=discord.Color.green()
-            )
-            view = CopyButton("\n".join(keys), "📋 Copy Key")
-            await interaction.user.send(embed=embed, view=view)
-            await interaction.response.send_message(
-                f"🎉 {interaction.user.mention} guessed the number **{game['number']}**! They won **{prize_display}**! Check your DMs!",
-                ephemeral=False
-            )
-        except:
-            await interaction.response.send_message(
-                f"🎉 {interaction.user.mention} guessed the number **{game['number']}**! They won **{prize_display}**!\n{key_list}\n\n(Please open your DMs for future prizes)",
-                ephemeral=False
-            )
-    
-    elif new_guesses >= game["max_guesses"]:
-        # Out of guesses
-        conn.execute(
-            "UPDATE number_games SET active=0 WHERE id=?",
-            (game["id"],)
-        )
-        conn.commit()
-        conn.close()
-        
-        await interaction.response.send_message(
-            f"❌ Out of guesses! The number was **{game['number']}**.\n\n"
-            f"Use `/startnumber` to start a new game!",
-            ephemeral=False
-        )
-    
-    else:
-        # Wrong guess - give hint
-        hint = "higher" if number < game["number"] else "lower"
-        remaining = game["max_guesses"] - new_guesses
-        conn.close()
-        
-        await interaction.response.send_message(
-            f"❌ {number} is too **{hint}**! "
-            f"({remaining} guesses remaining)",
-            ephemeral=True
-        )
 
 @bot.tree.command(name="endnumber", description="End the current number game")
 async def endnumber(interaction: discord.Interaction):
