@@ -34,7 +34,8 @@ def init_db():
             created_at TEXT NOT NULL,
             last_used TEXT,
             uses INTEGER NOT NULL DEFAULT 0,
-            last_hwid_reset TEXT
+            last_hwid_reset TEXT,
+            expires_at TEXT
         )
     """)
     conn.execute("""
@@ -75,16 +76,6 @@ def make_key():
     parts = ["".join(secrets.choice(alphabet) for _ in range(5)) for _ in range(4)]
     return "XYN-" + "-".join(parts)
 
-def create_prize_key(days: int = None, months: int = None, years: int = None):
-    """Create a key that expires after a certain time"""
-    if years:
-        days = years * 365
-    if months:
-        days = months * 30
-    if not days:
-        days = 1
-    return make_key(), days
-
 def is_admin(interaction):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
@@ -92,7 +83,7 @@ def is_admin(interaction):
         return True
     return ADMIN_ROLE_ID != 0 and any(r.id == ADMIN_ROLE_ID for r in interaction.user.roles)
 
-# ========== DISCORD PANEL VIEW WITH COPY BUTTONS ==========
+# ========== COPY BUTTON VIEW ==========
 class CopyButton(discord.ui.View):
     def __init__(self, text_to_copy: str, label: str = "📋 Copy"):
         super().__init__(timeout=60)
@@ -110,6 +101,7 @@ class CopyButton(discord.ui.View):
             ephemeral=True
         )
 
+# ========== DISCORD PANEL VIEW ==========
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -165,6 +157,12 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
         
         if row["active"] == 0:
             return await interaction.response.send_message("❌ This key has been revoked.", ephemeral=True)
+        
+        # Check if expired
+        if row["expires_at"]:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if datetime.now(timezone.utc) > expires_at:
+                return await interaction.response.send_message("❌ This key has expired.", ephemeral=True)
         
         if row["discord_id"] != str(interaction.user.id) and row["discord_id"] != "UNASSIGNED":
             return await interaction.response.send_message("❌ This key doesn't belong to you.", ephemeral=True)
@@ -240,7 +238,6 @@ async def on_interaction(interaction: discord.Interaction):
         )
         embed.set_footer(text="Copy this into your executor")
         
-        # Send with copy button
         view = CopyButton(loadstring, "📋 Copy Loadstring")
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         return
@@ -330,7 +327,7 @@ async def whitelist(interaction: discord.Interaction, user: discord.Member, days
     if not is_admin(interaction):
         return await interaction.response.send_message("❌ No permission.", ephemeral=True)
     
-    if days < 1 or days > 3650:  # Max 10 years
+    if days < 1 or days > 3650:
         return await interaction.response.send_message("❌ Days must be between 1 and 3650.", ephemeral=True)
     
     key = make_key()
@@ -622,14 +619,16 @@ async def riddles(interaction: discord.Interaction):
     max_number="Maximum number to guess (e.g., 100)",
     max_guesses="Maximum guesses allowed (default: 5)",
     prize_type="Type of prize: lifetime, day, week, month, year",
-    prize_value="Number of days/weeks/months/years (e.g., 1, 2, 7)"
+    prize_value="Number of days/weeks/months/years (e.g., 1, 2, 7)",
+    winning_number="The number that wins (optional, random if not set)"
 )
 async def startnumber(
     interaction: discord.Interaction,
     max_number: int,
     max_guesses: int = 5,
     prize_type: str = "day",
-    prize_value: int = 1
+    prize_value: int = 1,
+    winning_number: int = None
 ):
     if not is_admin(interaction):
         return await interaction.response.send_message("❌ No permission.", ephemeral=True)
@@ -647,8 +646,13 @@ async def startnumber(
     if prize_value < 1 or prize_value > 365:
         return await interaction.response.send_message("❌ Prize value must be between 1 and 365.", ephemeral=True)
     
-    # Generate the random number
-    secret_number = random.randint(1, max_number)
+    # Set winning number
+    if winning_number is not None:
+        if winning_number < 1 or winning_number > max_number:
+            return await interaction.response.send_message(f"❌ Winning number must be between 1 and {max_number}.", ephemeral=True)
+        secret_number = winning_number
+    else:
+        secret_number = random.randint(1, max_number)
     
     # Save to database
     conn = db()
@@ -685,7 +689,7 @@ async def startnumber(
     embed.set_footer(text=f"Game #{game_id} | Posted by {interaction.user.name}")
     
     await interaction.channel.send(embed=embed)
-    await interaction.response.send_message("✅ Number game started!", ephemeral=True)
+    await interaction.response.send_message(f"✅ Number game started! (Winning number: {secret_number if winning_number else 'random'})", ephemeral=True)
 
 @bot.tree.command(name="guessnumber", description="Guess the number in the current game")
 @app_commands.describe(number="Your guess")
