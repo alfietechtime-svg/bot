@@ -23,7 +23,6 @@ def db():
 
 def init_db():
     conn = db()
-    # Licenses table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
@@ -37,7 +36,6 @@ def init_db():
             last_hwid_reset TEXT
         )
     """)
-    # Riddles table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS riddles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +135,7 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
             conn.commit()
             conn.close()
         
+        # Always grant role if configured (no extra check)
         if WHITELIST_ROLE_ID:
             role = interaction.guild.get_role(WHITELIST_ROLE_ID)
             if role:
@@ -154,7 +153,6 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        # intents.message_content = True  # DISABLED for Render
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -176,12 +174,10 @@ async def on_interaction(interaction: discord.Interaction):
     
     custom_id = interaction.data.get("custom_id") if interaction.data else None
     
-    # Handle Redeem Key button
     if custom_id == "redeem_key":
         await interaction.response.send_modal(RedeemModal())
         return
     
-    # Handle Get Script button
     if custom_id == "get_script":
         conn = db()
         row = conn.execute(
@@ -205,7 +201,6 @@ async def on_interaction(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     
-    # Handle Get Role button
     if custom_id == "get_role":
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("Use this inside the server.", ephemeral=True)
@@ -234,7 +229,6 @@ async def on_interaction(interaction: discord.Interaction):
             await interaction.response.send_message("❌ I can't manage that role. Put my role above the whitelist role.", ephemeral=True)
         return
     
-    # Handle Reset HWID button
     if custom_id == "reset_hwid":
         conn = db()
         row = conn.execute(
@@ -246,7 +240,6 @@ async def on_interaction(interaction: discord.Interaction):
         if not row:
             return await interaction.response.send_message("❌ You don't have an active license.", ephemeral=True)
         
-        # Check cooldown
         if row["last_hwid_reset"]:
             last_reset = datetime.fromisoformat(row["last_hwid_reset"])
             time_since = datetime.now(timezone.utc) - last_reset
@@ -259,7 +252,6 @@ async def on_interaction(interaction: discord.Interaction):
                     ephemeral=True
                 )
         
-        # Reset HWID
         conn = db()
         conn.execute(
             "UPDATE licenses SET hwid=NULL, last_hwid_reset=? WHERE key=?",
@@ -271,7 +263,6 @@ async def on_interaction(interaction: discord.Interaction):
         await interaction.response.send_message("✅ HWID has been reset! You can now use your key on a new device.", ephemeral=True)
         return
     
-    # Handle Stats button
     if custom_id == "show_stats":
         conn = db()
         total = conn.execute("SELECT COUNT(*) c FROM licenses").fetchone()["c"]
@@ -304,7 +295,6 @@ async def whitelist(interaction: discord.Interaction, user: discord.Member):
     conn.commit()
     conn.close()
     
-    # Try to DM the user
     try:
         embed = discord.Embed(
             title="🔑 Your License Key",
@@ -314,7 +304,6 @@ async def whitelist(interaction: discord.Interaction, user: discord.Member):
         await user.send(embed=embed)
         await interaction.response.send_message(f"✅ Whitelisted {user.mention}. Key sent via DM.", ephemeral=True)
     except:
-        # If DMs are closed, send the key as an ephemeral message (only the admin sees it)
         await interaction.response.send_message(
             f"✅ Whitelisted {user.mention} but DMs are closed.\n**Key:** `{key}`\n(Only you can see this)",
             ephemeral=True
@@ -359,7 +348,7 @@ async def revoke(interaction: discord.Interaction, key: str):
     conn.close()
     await interaction.response.send_message("✅ Key revoked." if cur.rowcount else "❌ Key not found.", ephemeral=True)
 
-@bot.tree.command(name="generate", description="Generate random keys for giveaways (not assigned to anyone)")
+@bot.tree.command(name="generate", description="Generate random keys for giveaways")
 @app_commands.describe(amount="Number of keys to generate (1-10)")
 async def generate(interaction: discord.Interaction, amount: int = 1):
     if not is_admin(interaction):
@@ -398,11 +387,11 @@ async def panelsetup(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ No permission.", ephemeral=True)
     
     embed = discord.Embed(
-        title="XYNTRIXREDEEMER",
+        title="🔐 License Panel",
         description="🔑 Click **'Redeem Key'** to enter your license key.\n\nUse the other buttons to get your script, manage HWID, or view stats.",
         color=discord.Color.gold()
     )
-    embed.set_footer(text="XYNTRIXSCRIPTS")
+    embed.set_footer(text="Your License System")
     await interaction.channel.send(embed=embed, view=PanelView())
     await interaction.response.send_message("✅ Panel sent!", ephemeral=True)
 
@@ -420,7 +409,6 @@ async def keys(interaction: discord.Interaction):
     if not rows:
         return await interaction.response.send_message("No keys assigned to users yet.", ephemeral=True)
     
-    # Split into chunks of 10 to avoid message length limits
     chunks = []
     current_chunk = []
     for row in rows:
@@ -433,7 +421,6 @@ async def keys(interaction: discord.Interaction):
     if current_chunk:
         chunks.append("\n".join(current_chunk))
     
-    # Send first chunk as embed
     embed = discord.Embed(
         title="🔑 All Users & Keys",
         description=chunks[0],
@@ -443,7 +430,6 @@ async def keys(interaction: discord.Interaction):
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
     
-    # Send remaining chunks as plain text
     for chunk in chunks[1:]:
         await interaction.followup.send(f"```\n{chunk}\n```", ephemeral=True)
 
@@ -455,9 +441,8 @@ async def riddle(interaction: discord.Interaction, question: str, answer: str, p
     if not is_admin(interaction):
         return await interaction.response.send_message("❌ No permission.", ephemeral=True)
     
-    # Check if prize is "lifetime" or a number
     if prize.lower() == "lifetime":
-        prize_value = 999  # Lifetime = 999 keys
+        prize_value = 999
         prize_display = "🔑 LIFETIME (999 keys)"
     else:
         try:
@@ -468,7 +453,6 @@ async def riddle(interaction: discord.Interaction, question: str, answer: str, p
         except ValueError:
             return await interaction.response.send_message("❌ Prize must be a number or 'lifetime'.", ephemeral=True)
     
-    # Save riddle to database
     conn = db()
     cursor = conn.execute(
         "INSERT INTO riddles (question, answer, prize, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -478,7 +462,6 @@ async def riddle(interaction: discord.Interaction, question: str, answer: str, p
     conn.commit()
     conn.close()
     
-    # Post the riddle
     embed = discord.Embed(
         title="🧩 Riddle Time!",
         description=f"**{question}**\n\n💡 Prize: **{prize_display}**\n\nReply with `/guess` to answer!",
@@ -492,7 +475,6 @@ async def riddle(interaction: discord.Interaction, question: str, answer: str, p
 @bot.tree.command(name="guess", description="Guess the answer to the current riddle")
 @app_commands.describe(answer="Your guess")
 async def guess(interaction: discord.Interaction, answer: str):
-    # Check if there's an active riddle
     conn = db()
     riddle = conn.execute(
         "SELECT * FROM riddles WHERE active=1 ORDER BY id DESC LIMIT 1"
@@ -502,19 +484,15 @@ async def guess(interaction: discord.Interaction, answer: str):
         conn.close()
         return await interaction.response.send_message("❌ No active riddle to guess!", ephemeral=True)
     
-    # Check if user already won this riddle
     if riddle["winner_id"] == str(interaction.user.id):
         conn.close()
         return await interaction.response.send_message("❌ You already solved this riddle!", ephemeral=True)
     
-    # Check if riddle is already solved
     if riddle["winner_id"]:
         conn.close()
         return await interaction.response.send_message(f"❌ This riddle has already been solved by {riddle['winner_name']}!", ephemeral=True)
     
-    # Check answer
     if answer.lower().strip() == riddle["answer"]:
-        # Generate prize keys
         prize = riddle["prize"]
         keys = []
         for _ in range(prize):
@@ -525,7 +503,6 @@ async def guess(interaction: discord.Interaction, answer: str):
             )
             keys.append(key)
         
-        # Mark riddle as solved
         conn.execute(
             "UPDATE riddles SET active=0, winner_id=?, winner_name=?, won_at=? WHERE id=?",
             (str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat(), riddle["id"])
@@ -533,15 +510,25 @@ async def guess(interaction: discord.Interaction, answer: str):
         conn.commit()
         conn.close()
         
-        # Send prize
+        # Send keys via DM
         key_list = "\n".join([f"`{k}`" for k in keys])
-        embed = discord.Embed(
-            title="🎉 Correct Answer!",
-            description=f"{interaction.user.mention} solved the riddle!\n\n**Prize:** {prize} key(s)\n{key_list}\n\nRedeem them using the **'Redeem Key'** button!",
-            color=discord.Color.green()
-        )
-        await interaction.channel.send(embed=embed)
-        await interaction.response.send_message("✅ You got it right! Check the channel for your prize.", ephemeral=True)
+        try:
+            embed = discord.Embed(
+                title="🎉 You Solved the Riddle!",
+                description=f"You won **{prize}** key(s)!\n\n{key_list}\n\nRedeem them using the **'Redeem Key'** button in the panel!",
+                color=discord.Color.green()
+            )
+            await interaction.user.send(embed=embed)
+            await interaction.response.send_message(
+                f"🎉 Correct! {interaction.user.mention} won **{prize}** key(s)! Check your DMs!",
+                ephemeral=False
+            )
+        except:
+            # If DMs closed, send in channel (but this is rare)
+            await interaction.response.send_message(
+                f"🎉 Correct! {interaction.user.mention} won **{prize}** key(s)!\n{key_list}\n\n(Please open your DMs for future prizes)",
+                ephemeral=False
+            )
     else:
         conn.close()
         await interaction.response.send_message("❌ Wrong answer! Try again.", ephemeral=True)
