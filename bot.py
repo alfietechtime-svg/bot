@@ -154,7 +154,7 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True
+        # intents.message_content = True  # DISABLED for Render
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -304,6 +304,7 @@ async def whitelist(interaction: discord.Interaction, user: discord.Member):
     conn.commit()
     conn.close()
     
+    # Try to DM the user
     try:
         embed = discord.Embed(
             title="🔑 Your License Key",
@@ -311,11 +312,13 @@ async def whitelist(interaction: discord.Interaction, user: discord.Member):
             color=discord.Color.gold()
         )
         await user.send(embed=embed)
-        msg = f"✅ Whitelisted {user.mention}. Key sent via DM."
+        await interaction.response.send_message(f"✅ Whitelisted {user.mention}. Key sent via DM.", ephemeral=True)
     except:
-        msg = f"✅ Whitelisted {user.mention}. Key: `{key}` (DMs closed)"
-    
-    await interaction.response.send_message(msg, ephemeral=True)
+        # If DMs are closed, send the key as an ephemeral message (only the admin sees it)
+        await interaction.response.send_message(
+            f"✅ Whitelisted {user.mention} but DMs are closed.\n**Key:** `{key}`\n(Only you can see this)",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="unwhitelist", description="Revoke all keys for a user")
 @app_commands.describe(user="The user")
@@ -446,20 +449,30 @@ async def keys(interaction: discord.Interaction):
 
 # ========== RIDDLE COMMANDS ==========
 
-@bot.tree.command(name="riddle", description="Post a riddle for users to solve (prize: keys)")
-@app_commands.describe(question="The riddle question", answer="The correct answer (case insensitive)", prize="Number of keys to give as prize (default: 1)")
-async def riddle(interaction: discord.Interaction, question: str, answer: str, prize: int = 1):
+@bot.tree.command(name="riddle", description="Post a riddle for users to solve")
+@app_commands.describe(question="The riddle question", answer="The correct answer", prize="Number of keys or 'lifetime'")
+async def riddle(interaction: discord.Interaction, question: str, answer: str, prize: str = "1"):
     if not is_admin(interaction):
         return await interaction.response.send_message("❌ No permission.", ephemeral=True)
     
-    if prize < 1 or prize > 10:
-        return await interaction.response.send_message("❌ Prize must be between 1-10 keys.", ephemeral=True)
+    # Check if prize is "lifetime" or a number
+    if prize.lower() == "lifetime":
+        prize_value = 999  # Lifetime = 999 keys
+        prize_display = "🔑 LIFETIME (999 keys)"
+    else:
+        try:
+            prize_value = int(prize)
+            if prize_value < 1 or prize_value > 10:
+                return await interaction.response.send_message("❌ Prize must be between 1-10 keys or 'lifetime'.", ephemeral=True)
+            prize_display = f"{prize_value} key(s)"
+        except ValueError:
+            return await interaction.response.send_message("❌ Prize must be a number or 'lifetime'.", ephemeral=True)
     
     # Save riddle to database
     conn = db()
     cursor = conn.execute(
         "INSERT INTO riddles (question, answer, prize, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-        (question, answer.lower().strip(), prize, str(interaction.user), datetime.now(timezone.utc).isoformat())
+        (question, answer.lower().strip(), prize_value, str(interaction.user), datetime.now(timezone.utc).isoformat())
     )
     riddle_id = cursor.lastrowid
     conn.commit()
@@ -468,7 +481,7 @@ async def riddle(interaction: discord.Interaction, question: str, answer: str, p
     # Post the riddle
     embed = discord.Embed(
         title="🧩 Riddle Time!",
-        description=f"**{question}**\n\n💡 Prize: **{prize} key(s)**\n\nReply with `/guess` to answer!",
+        description=f"**{question}**\n\n💡 Prize: **{prize_display}**\n\nReply with `/guess` to answer!",
         color=discord.Color.purple()
     )
     embed.set_footer(text=f"Riddle #{riddle_id} | Posted by {interaction.user.name}")
