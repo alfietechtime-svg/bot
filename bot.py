@@ -23,6 +23,7 @@ def db():
 
 def init_db():
     conn = db()
+    # Licenses table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
@@ -34,6 +35,21 @@ def init_db():
             last_used TEXT,
             uses INTEGER NOT NULL DEFAULT 0,
             last_hwid_reset TEXT
+        )
+    """)
+    # Riddles table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS riddles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            prize INTEGER DEFAULT 1,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            winner_id TEXT,
+            winner_name TEXT,
+            won_at TEXT
         )
     """)
     conn.commit()
@@ -108,8 +124,18 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
         if row["active"] == 0:
             return await interaction.response.send_message("❌ This key has been revoked.", ephemeral=True)
         
-        if row["discord_id"] != str(interaction.user.id):
+        if row["discord_id"] != str(interaction.user.id) and row["discord_id"] != "UNASSIGNED":
             return await interaction.response.send_message("❌ This key doesn't belong to you.", ephemeral=True)
+        
+        # If key is unassigned, assign it to this user
+        if row["discord_id"] == "UNASSIGNED":
+            conn = db()
+            conn.execute(
+                "UPDATE licenses SET discord_id=?, username=? WHERE key=?",
+                (str(interaction.user.id), str(interaction.user), key)
+            )
+            conn.commit()
+            conn.close()
         
         if WHITELIST_ROLE_ID:
             role = interaction.guild.get_role(WHITELIST_ROLE_ID)
@@ -128,6 +154,7 @@ class RedeemModal(discord.ui.Modal, title="🔑 Redeem Your Key"):
 class Bot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -261,6 +288,7 @@ async def on_interaction(interaction: discord.Interaction):
         return
 
 # ========== SLASH COMMANDS ==========
+
 @bot.tree.command(name="whitelist", description="Whitelist a user and DM them a key")
 @app_commands.describe(user="The user to whitelist")
 async def whitelist(interaction: discord.Interaction, user: discord.Member):
@@ -328,6 +356,39 @@ async def revoke(interaction: discord.Interaction, key: str):
     conn.close()
     await interaction.response.send_message("✅ Key revoked." if cur.rowcount else "❌ Key not found.", ephemeral=True)
 
+@bot.tree.command(name="generate", description="Generate random keys for giveaways (not assigned to anyone)")
+@app_commands.describe(amount="Number of keys to generate (1-10)")
+async def generate(interaction: discord.Interaction, amount: int = 1):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    
+    if amount < 1 or amount > 10:
+        return await interaction.response.send_message("❌ Please generate between 1-10 keys.", ephemeral=True)
+    
+    keys = []
+    conn = db()
+    
+    for _ in range(amount):
+        key = make_key()
+        conn.execute(
+            "INSERT INTO licenses(key, discord_id, username, created_at) VALUES (?, ?, ?, ?)",
+            (key, "UNASSIGNED", "UNASSIGNED", datetime.now(timezone.utc).isoformat())
+        )
+        keys.append(key)
+    
+    conn.commit()
+    conn.close()
+    
+    key_list = "\n".join([f"`{k}`" for k in keys])
+    embed = discord.Embed(
+        title=f"🔑 Generated {amount} Key(s)",
+        description=f"{key_list}\n\nUsers can redeem these by clicking the **'Redeem Key'** button!",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="These keys are not assigned to anyone yet.")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="panelsetup", description="Post the control panel")
 async def panelsetup(interaction: discord.Interaction):
     if not is_admin(interaction):
@@ -341,6 +402,162 @@ async def panelsetup(interaction: discord.Interaction):
     embed.set_footer(text="XYNTRIXSCRIPTS")
     await interaction.channel.send(embed=embed, view=PanelView())
     await interaction.response.send_message("✅ Panel sent!", ephemeral=True)
+
+@bot.tree.command(name="keys", description="Show all users and their active keys")
+async def keys(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    
+    conn = db()
+    rows = conn.execute(
+        "SELECT discord_id, username, key, active, created_at FROM licenses WHERE discord_id != 'UNASSIGNED' ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    
+    if not rows:
+        return await interaction.response.send_message("No keys assigned to users yet.", ephemeral=True)
+    
+    # Split into chunks of 10 to avoid message length limits
+    chunks = []
+    current_chunk = []
+    for row in rows:
+        status = "✅" if row["active"] == 1 else "❌"
+        line = f"{status} **{row['username']}** → `{row['key']}`"
+        current_chunk.append(line)
+        if len(current_chunk) >= 10:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+    
+    # Send first chunk as embed
+    embed = discord.Embed(
+        title="🔑 All Users & Keys",
+        description=chunks[0],
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text=f"Total: {len(rows)} keys assigned")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    
+    # Send remaining chunks as plain text
+    for chunk in chunks[1:]:
+        await interaction.followup.send(f"```\n{chunk}\n```", ephemeral=True)
+
+# ========== RIDDLE COMMANDS ==========
+
+@bot.tree.command(name="riddle", description="Post a riddle for users to solve (prize: keys)")
+@app_commands.describe(question="The riddle question", answer="The correct answer (case insensitive)", prize="Number of keys to give as prize (default: 1)")
+async def riddle(interaction: discord.Interaction, question: str, answer: str, prize: int = 1):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    
+    if prize < 1 or prize > 10:
+        return await interaction.response.send_message("❌ Prize must be between 1-10 keys.", ephemeral=True)
+    
+    # Save riddle to database
+    conn = db()
+    cursor = conn.execute(
+        "INSERT INTO riddles (question, answer, prize, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        (question, answer.lower().strip(), prize, str(interaction.user), datetime.now(timezone.utc).isoformat())
+    )
+    riddle_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    # Post the riddle
+    embed = discord.Embed(
+        title="🧩 Riddle Time!",
+        description=f"**{question}**\n\n💡 Prize: **{prize} key(s)**\n\nReply with `/guess` to answer!",
+        color=discord.Color.purple()
+    )
+    embed.set_footer(text=f"Riddle #{riddle_id} | Posted by {interaction.user.name}")
+    
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("✅ Riddle posted!", ephemeral=True)
+
+@bot.tree.command(name="guess", description="Guess the answer to the current riddle")
+@app_commands.describe(answer="Your guess")
+async def guess(interaction: discord.Interaction, answer: str):
+    # Check if there's an active riddle
+    conn = db()
+    riddle = conn.execute(
+        "SELECT * FROM riddles WHERE active=1 ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    
+    if not riddle:
+        conn.close()
+        return await interaction.response.send_message("❌ No active riddle to guess!", ephemeral=True)
+    
+    # Check if user already won this riddle
+    if riddle["winner_id"] == str(interaction.user.id):
+        conn.close()
+        return await interaction.response.send_message("❌ You already solved this riddle!", ephemeral=True)
+    
+    # Check if riddle is already solved
+    if riddle["winner_id"]:
+        conn.close()
+        return await interaction.response.send_message(f"❌ This riddle has already been solved by {riddle['winner_name']}!", ephemeral=True)
+    
+    # Check answer
+    if answer.lower().strip() == riddle["answer"]:
+        # Generate prize keys
+        prize = riddle["prize"]
+        keys = []
+        for _ in range(prize):
+            key = make_key()
+            conn.execute(
+                "INSERT INTO licenses(key, discord_id, username, created_at) VALUES (?, ?, ?, ?)",
+                (key, str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat())
+            )
+            keys.append(key)
+        
+        # Mark riddle as solved
+        conn.execute(
+            "UPDATE riddles SET active=0, winner_id=?, winner_name=?, won_at=? WHERE id=?",
+            (str(interaction.user.id), str(interaction.user), datetime.now(timezone.utc).isoformat(), riddle["id"])
+        )
+        conn.commit()
+        conn.close()
+        
+        # Send prize
+        key_list = "\n".join([f"`{k}`" for k in keys])
+        embed = discord.Embed(
+            title="🎉 Correct Answer!",
+            description=f"{interaction.user.mention} solved the riddle!\n\n**Prize:** {prize} key(s)\n{key_list}\n\nRedeem them using the **'Redeem Key'** button!",
+            color=discord.Color.green()
+        )
+        await interaction.channel.send(embed=embed)
+        await interaction.response.send_message("✅ You got it right! Check the channel for your prize.", ephemeral=True)
+    else:
+        conn.close()
+        await interaction.response.send_message("❌ Wrong answer! Try again.", ephemeral=True)
+
+@bot.tree.command(name="riddles", description="Show all riddles and their status")
+async def riddles(interaction: discord.Interaction):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("❌ No permission.", ephemeral=True)
+    
+    conn = db()
+    riddles_list = conn.execute(
+        "SELECT * FROM riddles ORDER BY id DESC LIMIT 10"
+    ).fetchall()
+    conn.close()
+    
+    if not riddles_list:
+        return await interaction.response.send_message("No riddles found.", ephemeral=True)
+    
+    embed = discord.Embed(title="📋 Recent Riddles", color=discord.Color.blue())
+    for r in riddles_list:
+        status = "✅ Solved" if r["winner_id"] else "⏳ Active"
+        winner = r["winner_name"] if r["winner_name"] else "No winner yet"
+        embed.add_field(
+            name=f"#{r['id']} - {status}",
+            value=f"Q: {r['question'][:50]}...\nPrize: {r['prize']} keys\nWinner: {winner}",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ========== MAIN ==========
 def main():
